@@ -1,6 +1,7 @@
 import pandas as pd
 import math
 import pdb
+import copy
 
 show_count = 0
 
@@ -18,6 +19,10 @@ class Attribute:
     def __init__(self, name, type):
         self.name = name
         self.type = type
+        self.division_point = -1
+
+    def set_division_point(self, division_point):
+        self.division_point = division_point
 
 
 class DecisionTreeNode:
@@ -46,8 +51,14 @@ class DecisionTreeNode:
     def forward(self, example):
         if self.type == NodeType.INNER_NODE:
             # 内节点
-            value = example[self.attr.name]
-            next_node = self.forward_map[value]
+            if self.attr.type == AttributeType.DISCRETE:
+                value = example[self.attr.name]
+                next_node = self.forward_map[value]
+            elif self.attr.type == AttributeType.CONTINUOUS:
+                if example[self.attr.name] > self.attr.division_point:
+                    next_node = self.forward_map['greater']
+                else:
+                    next_node = self.forward_map['smaller']
             return next_node.forward(example)
         else:
             # 叶子节点
@@ -134,7 +145,7 @@ class DecisionTree:
         result -= negative_percentage * math.log2(negative_percentage)
         return result
 
-    def _info_gain(self, entropy_origin, size_origin, partitions):
+    def _info_gain_discrete_attribute(self, entropy_origin, size_origin, partitions):
         # 返回经过划分之后减少的熵
         gain = entropy_origin
         for partition in partitions:
@@ -159,20 +170,59 @@ class DecisionTree:
         intrinsic_value = self._intrinsic_value(size_origin, partitions)
         return info_gain / intrinsic_value
 
-    def _get_all_possible_values(self, attribute):
+    def _get_attr_all_possible_values(self, attribute):
         # 返回某个属性的所有可能取值
         if attribute.type == AttributeType.DISCRETE:
             return self.discrete_attr_info[attribute.name]
         else:
-            return self.continuous_attr_info[attribute.name]
+            return ['greater', 'smaller']
 
-    def _get_attribute_partition(self, data, attribute, values):
+    def _get_discrete_attribute_partition(self, data, attribute, values):
         # 将数据以 attribute 的不同取值划分为不同的集合
         result = {}
         for value in values:
             part = data[data[attribute.name] == value]
             result[value] = part
         return result
+
+
+    def _get_division_points(self, attribute, examples):
+        # 获取连续数据的分割点集合
+        # 获取数据域上的所有值，并且进行排序
+        values = list(set(examples[attribute.name]))
+        values.sort()
+
+        division_points = []
+        for i in range(len(values)-1):
+            division_points.append((values[i] + values[i+1]) / 2)
+
+        return division_points
+
+    def _get_continuous_attribute_partition(self, attribute, examples, division_point):
+        partition = {}
+        greater_part = examples[examples[attribute.name] > division_point]
+        smaller_part = examples[examples[attribute.name] <= division_point]
+        partition['greater'] = greater_part
+        partition['smaller'] = smaller_part
+        return partition
+
+    def _info_gain_continuous(self, attribute, examples):
+        # 获取连续值的最大信息增益及其划分点
+        entropy_ori = self._entropy(examples)
+        size_origin = len(examples)
+        division_points = self._get_division_points(attribute, examples)
+        max_info_gain = -1
+        optimal_division_point = -1
+        for division_point in division_points:
+            partitions = self._get_continuous_attribute_partition(attribute, examples, division_point)
+            info_gain = entropy_ori
+            for partition in partitions.values():
+                info_gain -= len(partition) / size_origin * self._entropy(partition)
+            if info_gain > max_info_gain:
+                max_info_gain = info_gain
+                optimal_division_point = division_point
+        return max_info_gain, optimal_division_point
+
 
     def _optimal_attribute(self, data, attributes):
         # 返回一个最优属性划分
@@ -184,13 +234,22 @@ class DecisionTree:
 
         # 计算每一种属性的信息增益和增益率
         for attribute in attributes:
-            partition = self._get_attribute_partition(
-                data,
-                attribute,
-                self._get_all_possible_values(attribute)
-            ).values()
-            info_gains[attribute.name] = self._info_gain(entropy_origin, size_origin, partition)
-            info_gains_ratio[attribute.name] = self._info_gain_ratio(info_gains[attribute.name], size_origin, partition)
+            if attribute.type == AttributeType.DISCRETE:
+                # 离散值
+                partition = self._get_discrete_attribute_partition(
+                    data,
+                    attribute,
+                    self._get_attr_all_possible_values(attribute)
+                ).values()
+                info_gains[attribute.name] = self._info_gain_discrete_attribute(entropy_origin, size_origin, partition)
+                info_gains_ratio[attribute.name] = self._info_gain_ratio(info_gains[attribute.name], size_origin, partition)
+            elif attribute.type == AttributeType.CONTINUOUS:
+                # 连续值
+                info_gain, division_point = self._info_gain_continuous(attribute, data)
+                attribute.set_division_point(division_point)
+                info_gains[attribute.name] = info_gain
+                partition = self._get_continuous_attribute_partition(attribute, data, division_point).values()
+                info_gains_ratio[attribute.name] = self._info_gain_ratio(info_gain, size_origin, partition)
 
         avg_info_gains = sum(info_gains.values()) / len(info_gains)
         optimal_attribute = None
@@ -231,6 +290,18 @@ class DecisionTree:
     #
     #     return optimal_attribute
 
+    def _remove_attr_from_list(self, attributes, attr):
+        for attribute in attributes:
+            if attribute.name == attr.name:
+                attributes.remove(attribute)
+                return
+
+    def _get_attribute_partition(self, examples, attribute, possible_values):
+        if attribute.type == AttributeType.DISCRETE:
+            return self._get_discrete_attribute_partition(examples, attribute, possible_values)
+        else:
+            return self._get_continuous_attribute_partition(attribute, examples, attribute.division_point)
+
     def _tree_generate(self, data, attributes: list):
         # 生成一个节点
         node = DecisionTreeNode()
@@ -252,14 +323,14 @@ class DecisionTree:
         # 寻找最优划分属性 a*
         optimal_attribute = self._optimal_attribute(data, attributes)
         # 最优划分属性的所有可能取值
-        possible_values = self._get_all_possible_values(optimal_attribute)
+        possible_values = self._get_attr_all_possible_values(optimal_attribute)
         # 使用最优划分属性对数据进行一个划分
         data_partition = self._get_attribute_partition(data, optimal_attribute, possible_values)
         # 生成分支
         node.set_type(NodeType.INNER_NODE)
         node.set_attr(optimal_attribute)
-        new_attributes = attributes.copy()
-        new_attributes.remove(optimal_attribute)
+        new_attributes = copy.deepcopy(attributes)
+        self._remove_attr_from_list(new_attributes, optimal_attribute)
         for value in possible_values:
             part = data_partition[value]
             if len(part) == 0:
